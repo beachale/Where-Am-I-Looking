@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "wail",
+  "version": "${version}",
+  "name": "Where Am I Looking (WAIL)",
+  "description": "Shows exact decimal coordinates for the visible block model surface under the crosshair.",
+  "authors": [
+    "wait"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.wait.lookcoords.LookCoordsClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.14",
+    "minecraft": "1.21.10",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
