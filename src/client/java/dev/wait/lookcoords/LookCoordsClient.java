@@ -1,8 +1,10 @@
 package dev.wait.lookcoords;
 
+import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
+import dev.wait.lookcoords.mixin.GameRendererAccessor;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -39,18 +41,36 @@ import java.util.Properties;
 public final class LookCoordsClient implements ClientModInitializer {
     private static final double MAX_DISTANCE = 256.0;
     private static final double EPSILON = 1.0e-7;
+    private static final double SIXTEENTH_STEP = 1.0 / 16.0;
+    private static final double MAX_CURSOR_SNAPPING_SENSITIVITY = SIXTEENTH_STEP / 2.0;
+    private static final double DEFAULT_CURSOR_SNAPPING_SENSITIVITY = MAX_CURSOR_SNAPPING_SENSITIVITY;
+    private static final double SNAP_RETICLE_MARGIN = 16.0;
+    private static final double SNAP_ANIMATION_MAX_DELTA_SECONDS = 0.1;
+    private static final double SNAP_POSITION_RESPONSE_SECONDS = 0.16;
+    private static final double SNAP_ALPHA_RESPONSE_SECONDS = 0.10;
     private static final int DEFAULT_DECIMAL_AMOUNT = 4;
     private static final int DEFAULT_TEXT_COLOR = 0xFFFFFFFF;
+    private static final int SNAP_RETICLE_MAX_ALPHA = 220;
     private static final Direction[] DIRECTIONS = Direction.values();
     private static final String[] COLOR_NAMES = {
             "white", "black", "red", "green", "blue", "yellow", "cyan", "magenta", "gray", "orange"
+    };
+    private static final String[] DECIMAL_TYPE_NAMES = {
+            "0.1", "0.0625"
     };
 
     private boolean enabled = true;
     private int decimalAmount = DEFAULT_DECIMAL_AMOUNT;
     private String coordinateFormat = coordinateFormat(DEFAULT_DECIMAL_AMOUNT);
+    private DecimalType decimalType = DecimalType.DECIMAL;
+    private boolean cursorSnapping = false;
+    private double cursorSnappingSensitivity = DEFAULT_CURSOR_SNAPPING_SENSITIVITY;
     private int textColor = DEFAULT_TEXT_COLOR;
     private Path configPath;
+    private long lastSnapAnimationNanos;
+    private double snapReticleX = Double.NaN;
+    private double snapReticleY = Double.NaN;
+    private double snapReticleAlpha;
 
     @Override
     public void onInitializeClient() {
@@ -67,6 +87,21 @@ public final class LookCoordsClient implements ClientModInitializer {
                                 .executes(this::showStatus)
                                 .then(ClientCommandManager.argument("amount", IntegerArgumentType.integer(0, 10))
                                         .executes(this::setDecimalAmount)))
+                        .then(ClientCommandManager.literal("decimaltype")
+                                .executes(this::showStatus)
+                                .then(ClientCommandManager.argument("type", StringArgumentType.word())
+                                        .suggests((context, builder) -> CommandSource.suggestMatching(DECIMAL_TYPE_NAMES, builder))
+                                        .executes(this::setDecimalType)))
+                        .then(ClientCommandManager.literal("cursorsnapping")
+                                .executes(this::toggleCursorSnapping)
+                                .then(ClientCommandManager.literal("on")
+                                        .executes(context -> setCursorSnapping(context, true)))
+                                .then(ClientCommandManager.literal("off")
+                                        .executes(context -> setCursorSnapping(context, false)))
+                                .then(ClientCommandManager.literal("sensitivity")
+                                        .executes(this::showCursorSnappingSensitivity)
+                                        .then(ClientCommandManager.argument("value", DoubleArgumentType.doubleArg(0.0, MAX_CURSOR_SNAPPING_SENSITIVITY))
+                                                .executes(this::setCursorSnappingSensitivity))))
                         .then(ClientCommandManager.literal("color")
                                 .executes(this::showStatus)
                                 .then(ClientCommandManager.argument("value", StringArgumentType.greedyString())
@@ -87,7 +122,9 @@ public final class LookCoordsClient implements ClientModInitializer {
             return;
         }
 
-        String text = String.format(Locale.ROOT, coordinateFormat, hit.x, hit.y, hit.z);
+        DisplayPoint displayPoint = displayPoint(hit);
+        renderSnapReticle(context, client, tickCounter.getTickProgress(false), displayPoint);
+        String text = formatCoordinates(displayPoint);
         TextRenderer textRenderer = client.textRenderer;
         int width = textRenderer.getWidth(text);
         int x = context.getScaledWindowWidth() - width - 6;
@@ -100,6 +137,9 @@ public final class LookCoordsClient implements ClientModInitializer {
     private int showStatus(CommandContext<FabricClientCommandSource> context) {
         context.getSource().sendFeedback(Text.literal("WAIL is " + (enabled ? "on" : "off")
                 + ", decimalamount is " + decimalAmount
+                + ", decimaltype is " + decimalType.commandValue()
+                + ", cursorsnapping is " + (cursorSnapping ? "on" : "off")
+                + ", cursorsnapping sensitivity is " + formatSetting(cursorSnappingSensitivity)
                 + ", color is #" + String.format(Locale.ROOT, "%06X", textColor & 0xFFFFFF) + "."));
         return 1;
     }
@@ -116,6 +156,45 @@ public final class LookCoordsClient implements ClientModInitializer {
         coordinateFormat = coordinateFormat(decimalAmount);
         saveConfig();
         context.getSource().sendFeedback(Text.literal("WAIL decimalamount set to " + decimalAmount + "."));
+        return 1;
+    }
+
+    private int setDecimalType(CommandContext<FabricClientCommandSource> context) {
+        String value = StringArgumentType.getString(context, "type");
+        DecimalType parsed = DecimalType.parse(value);
+        if (parsed == null) {
+            context.getSource().sendError(Text.literal("Invalid WAIL decimaltype. Use 0.1 or 0.0625."));
+            return 0;
+        }
+
+        decimalType = parsed;
+        saveConfig();
+        context.getSource().sendFeedback(Text.literal("WAIL decimaltype set to " + decimalType.commandValue() + "."));
+        return 1;
+    }
+
+    private int toggleCursorSnapping(CommandContext<FabricClientCommandSource> context) {
+        return setCursorSnapping(context, !cursorSnapping);
+    }
+
+    private int setCursorSnapping(CommandContext<FabricClientCommandSource> context, boolean value) {
+        cursorSnapping = value;
+        saveConfig();
+        context.getSource().sendFeedback(Text.literal("WAIL cursorsnapping is now " + (cursorSnapping ? "on." : "off.")));
+        return 1;
+    }
+
+    private int showCursorSnappingSensitivity(CommandContext<FabricClientCommandSource> context) {
+        context.getSource().sendFeedback(Text.literal("WAIL cursorsnapping sensitivity is "
+                + formatSetting(cursorSnappingSensitivity) + "."));
+        return 1;
+    }
+
+    private int setCursorSnappingSensitivity(CommandContext<FabricClientCommandSource> context) {
+        cursorSnappingSensitivity = DoubleArgumentType.getDouble(context, "value");
+        saveConfig();
+        context.getSource().sendFeedback(Text.literal("WAIL cursorsnapping sensitivity set to "
+                + formatSetting(cursorSnappingSensitivity) + "."));
         return 1;
     }
 
@@ -174,6 +253,9 @@ public final class LookCoordsClient implements ClientModInitializer {
         enabled = Boolean.parseBoolean(properties.getProperty("enabled", Boolean.toString(enabled)));
         decimalAmount = clamp(parseInt(properties.getProperty("decimalAmount"), decimalAmount), 0, 10);
         coordinateFormat = coordinateFormat(decimalAmount);
+        decimalType = DecimalType.parse(properties.getProperty("decimalType"), decimalType);
+        cursorSnapping = Boolean.parseBoolean(properties.getProperty("cursorSnapping", Boolean.toString(cursorSnapping)));
+        cursorSnappingSensitivity = clamp(parseDouble(properties.getProperty("cursorSnappingSensitivity"), cursorSnappingSensitivity), 0.0, MAX_CURSOR_SNAPPING_SENSITIVITY);
         textColor = 0xFF000000 | (parseInt(properties.getProperty("textColor"), textColor) & 0xFFFFFF);
     }
 
@@ -181,6 +263,9 @@ public final class LookCoordsClient implements ClientModInitializer {
         Properties properties = new Properties();
         properties.setProperty("enabled", Boolean.toString(enabled));
         properties.setProperty("decimalAmount", Integer.toString(decimalAmount));
+        properties.setProperty("decimalType", decimalType.commandValue());
+        properties.setProperty("cursorSnapping", Boolean.toString(cursorSnapping));
+        properties.setProperty("cursorSnappingSensitivity", formatSetting(cursorSnappingSensitivity));
         properties.setProperty("textColor", String.format(Locale.ROOT, "%06X", textColor & 0xFFFFFF));
 
         try {
@@ -189,6 +274,17 @@ public final class LookCoordsClient implements ClientModInitializer {
                 properties.store(writer, "Where Am I Looking (WAIL) client settings");
             }
         } catch (IOException ignored) {
+        }
+    }
+
+    private double parseDouble(String value, double fallback) {
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException ignored) {
+            return fallback;
         }
     }
 
@@ -207,8 +303,153 @@ public final class LookCoordsClient implements ClientModInitializer {
         return Math.max(min, Math.min(max, value));
     }
 
+    private double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
     private static String coordinateFormat(int decimals) {
         return "x %1$." + decimals + "f  y %2$." + decimals + "f  z %3$." + decimals + "f";
+    }
+
+    private DisplayPoint displayPoint(Vec3d hit) {
+        Vec3d snapped = snapToSixteenth(hit);
+        if (cursorSnapping && isWithinSnappingSensitivity(hit, snapped)) {
+            return new DisplayPoint(snapped, true, true);
+        }
+        if (decimalType == DecimalType.SIXTEENTH) {
+            return new DisplayPoint(snapped, true, false);
+        }
+        return new DisplayPoint(hit, false, false);
+    }
+
+    private Vec3d snapToSixteenth(Vec3d hit) {
+        return new Vec3d(
+                snapToSixteenth(hit.x),
+                snapToSixteenth(hit.y),
+                snapToSixteenth(hit.z)
+        );
+    }
+
+    private double snapToSixteenth(double value) {
+        double snapped = Math.round(value / SIXTEENTH_STEP) * SIXTEENTH_STEP;
+        return Math.abs(snapped) < EPSILON ? 0.0 : snapped;
+    }
+
+    private boolean isWithinSnappingSensitivity(Vec3d hit, Vec3d snapped) {
+        return Math.abs(hit.x - snapped.x) <= cursorSnappingSensitivity
+                && Math.abs(hit.y - snapped.y) <= cursorSnappingSensitivity
+                && Math.abs(hit.z - snapped.z) <= cursorSnappingSensitivity;
+    }
+
+    private String formatCoordinates(DisplayPoint displayPoint) {
+        Vec3d pos = displayPoint.pos();
+        if (displayPoint.sixteenthGrid()) {
+            return "x " + formatSixteenthCoordinate(pos.x)
+                    + "  y " + formatSixteenthCoordinate(pos.y)
+                    + "  z " + formatSixteenthCoordinate(pos.z);
+        }
+        return String.format(Locale.ROOT, coordinateFormat, pos.x, pos.y, pos.z);
+    }
+
+    private void renderSnapReticle(DrawContext context, MinecraftClient client, float tickProgress, DisplayPoint displayPoint) {
+        int width = context.getScaledWindowWidth();
+        int height = context.getScaledWindowHeight();
+        double centerX = width / 2.0;
+        double centerY = height / 2.0;
+        ScreenPoint target = displayPoint.cursorSnapped()
+                ? projectToScreen(client, tickProgress, displayPoint.pos(), width, height)
+                : null;
+
+        boolean active = target != null;
+        double targetX = active ? target.x() : centerX;
+        double targetY = active ? target.y() : centerY;
+        updateSnapReticleAnimation(targetX, targetY, active);
+        if (snapReticleAlpha <= 0.01) {
+            return;
+        }
+
+        int alpha = clamp((int) Math.round(snapReticleAlpha * SNAP_RETICLE_MAX_ALPHA), 0, SNAP_RETICLE_MAX_ALPHA);
+        int strongColor = (alpha << 24) | 0x55FFFF;
+        context.getMatrices().pushMatrix();
+        context.getMatrices().translate((float) snapReticleX, (float) snapReticleY);
+        drawSnapMarker(context, strongColor);
+        context.getMatrices().popMatrix();
+    }
+
+    private ScreenPoint projectToScreen(MinecraftClient client, float tickProgress, Vec3d point, int width, int height) {
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d relative = point.subtract(camera.getPos());
+        float yaw = camera.getYaw();
+        float pitch = camera.getPitch();
+        Vec3d forward = Vec3d.fromPolar(pitch, yaw).normalize();
+        Vec3d right = Vec3d.fromPolar(0.0F, yaw + 90.0F).normalize();
+        Vec3d up = right.crossProduct(forward).normalize();
+
+        double depth = relative.dotProduct(forward);
+        if (depth <= EPSILON) {
+            return null;
+        }
+
+        double cameraX = relative.dotProduct(right);
+        double cameraY = relative.dotProduct(up);
+        double fov = ((GameRendererAccessor) client.gameRenderer).wail$getFov(camera, tickProgress, true);
+        double tanHalfFov = Math.tan(Math.toRadians(fov) / 2.0);
+        double aspect = (double) width / (double) height;
+        double screenX = width / 2.0 + cameraX / (depth * tanHalfFov * aspect) * width / 2.0;
+        double screenY = height / 2.0 - cameraY / (depth * tanHalfFov) * height / 2.0;
+
+        if (screenX < -SNAP_RETICLE_MARGIN
+                || screenX > width + SNAP_RETICLE_MARGIN
+                || screenY < -SNAP_RETICLE_MARGIN
+                || screenY > height + SNAP_RETICLE_MARGIN) {
+            return null;
+        }
+        return new ScreenPoint(screenX, screenY);
+    }
+
+    private void updateSnapReticleAnimation(double targetX, double targetY, boolean active) {
+        long now = System.nanoTime();
+        double deltaSeconds = lastSnapAnimationNanos == 0L ? 1.0 / 60.0 : (now - lastSnapAnimationNanos) / 1_000_000_000.0;
+        lastSnapAnimationNanos = now;
+        double clampedDelta = clamp(deltaSeconds, 0.0, SNAP_ANIMATION_MAX_DELTA_SECONDS);
+        double positionEase = animationEase(clampedDelta, SNAP_POSITION_RESPONSE_SECONDS);
+        double alphaEase = animationEase(clampedDelta, SNAP_ALPHA_RESPONSE_SECONDS);
+
+        if (Double.isNaN(snapReticleX) || Double.isNaN(snapReticleY)) {
+            snapReticleX = targetX;
+            snapReticleY = targetY;
+        }
+
+        snapReticleX += (targetX - snapReticleX) * positionEase;
+        snapReticleY += (targetY - snapReticleY) * positionEase;
+        snapReticleAlpha += ((active ? 1.0 : 0.0) - snapReticleAlpha) * alphaEase;
+    }
+
+    private double animationEase(double deltaSeconds, double responseSeconds) {
+        return 1.0 - Math.pow(0.001, deltaSeconds / responseSeconds);
+    }
+
+    private void drawSnapMarker(DrawContext context, int color) {
+        context.fill(-1, -1, 1, 1, color);
+        context.fill(-4, -1, -2, 1, color);
+        context.fill(2, -1, 4, 1, color);
+        context.fill(-1, -4, 1, -2, color);
+        context.fill(-1, 2, 1, 4, color);
+    }
+
+    private String formatSixteenthCoordinate(double value) {
+        String formatted = String.format(Locale.ROOT, "%.4f", value);
+        while (formatted.contains(".") && formatted.endsWith("0")) {
+            formatted = formatted.substring(0, formatted.length() - 1);
+        }
+        if (formatted.endsWith(".")) {
+            formatted = formatted.substring(0, formatted.length() - 1);
+        }
+        return formatted.equals("-0") ? "0" : formatted;
+    }
+
+    private String formatSetting(double value) {
+        return formatSixteenthCoordinate(value);
     }
 
     private Vec3d traceVisibleBlockModel(MinecraftClient client) {
@@ -288,12 +529,13 @@ public final class LookCoordsClient implements ClientModInitializer {
     }
 
     private ModelHit traceQuads(List<BakedQuad> quads, BlockPos pos, Vec3d start, Vec3d direction, ModelHit best) {
+        Vec3d blockOffset = Vec3d.of(pos);
         for (BakedQuad quad : quads) {
             int[] data = quad.vertexData();
-            Vec3d v0 = vertex(data, 0).add(Vec3d.of(pos));
-            Vec3d v1 = vertex(data, 1).add(Vec3d.of(pos));
-            Vec3d v2 = vertex(data, 2).add(Vec3d.of(pos));
-            Vec3d v3 = vertex(data, 3).add(Vec3d.of(pos));
+            Vec3d v0 = vertex(data, 0).add(blockOffset);
+            Vec3d v1 = vertex(data, 1).add(blockOffset);
+            Vec3d v2 = vertex(data, 2).add(blockOffset);
+            Vec3d v3 = vertex(data, 3).add(blockOffset);
 
             best = closer(intersectTriangle(start, direction, v0, v1, v2), best);
             best = closer(intersectTriangle(start, direction, v0, v2, v3), best);
@@ -361,5 +603,42 @@ public final class LookCoordsClient implements ClientModInitializer {
     }
 
     private record ModelHit(Vec3d pos, double distance) {
+    }
+
+    private record DisplayPoint(Vec3d pos, boolean sixteenthGrid, boolean cursorSnapped) {
+    }
+
+    private record ScreenPoint(double x, double y) {
+    }
+
+    private enum DecimalType {
+        DECIMAL("0.1"),
+        SIXTEENTH("0.0625");
+
+        private final String commandValue;
+
+        DecimalType(String commandValue) {
+            this.commandValue = commandValue;
+        }
+
+        private String commandValue() {
+            return commandValue;
+        }
+
+        private static DecimalType parse(String value) {
+            return parse(value, null);
+        }
+
+        private static DecimalType parse(String value, DecimalType fallback) {
+            if (value == null) {
+                return fallback;
+            }
+            String normalized = value.trim().toLowerCase(Locale.ROOT);
+            return switch (normalized) {
+                case "0.1", "decimal", "decimals" -> DECIMAL;
+                case "0.0625", "1/16", "sixteenth", "sixteenths" -> SIXTEENTH;
+                default -> fallback;
+            };
+        }
     }
 }
